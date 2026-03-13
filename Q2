@@ -1,0 +1,572 @@
+"""
+模型II: 通过反事实模拟进行机制评估
+Dancing with the Stars - MCM Problem C
+
+核心问题: 聚合规则的选择——基于排名的(方案R)与基于百分比的(方案P)
+         是否系统性地偏向于特定类型的参赛者?
+
+方法:
+1. 重构潜在的粉丝支持分布(来自模型I)
+2. 对历史赛季进行反事实模拟
+3. 比较不同机制下参赛者的"生存概率"
+4. 分析"安全差距" AP = P(Survive|P) - P(Survive|R)
+"""
+
+import pandas as pd
+import numpy as np
+from scipy import stats
+import matplotlib.pyplot as plt
+from model_I_fan_vote_estimation import (
+    SimpleFanVoteEstimator, 
+    extract_weekly_scores, 
+    get_elimination_events,
+    get_finalists
+)
+
+
+class CounterfactualSimulator:
+    """
+    反事实模拟器: 评估不同投票机制的影响
+    
+    核心思路:
+    - 从模型I获得粉丝投票的后验分布
+    - 对每次模拟, 在两种规则下计算淘汰结果
+    - 统计"生存概率" P(Survive|Rule)
+    """
+    
+    def __init__(self, season_data, elimination_events, fan_vote_samples, contestants, contestant_idx):
+        """
+        参数:
+        - season_data: 每周评委分数数据
+        - elimination_events: 实际淘汰事件
+        - fan_vote_samples: 从模型I获得的粉丝投票样本 (n_samples, n_contestants)
+        - contestants: 选手名单
+        - contestant_idx: 选手名称到索引的映射
+        """
+        self.season_data = season_data
+        self.elimination_events = elimination_events
+        self.fan_vote_samples = fan_vote_samples
+        self.contestants = contestants
+        self.contestant_idx = contestant_idx
+        self.n_samples = len(fan_vote_samples)
+        
+    def simulate_week(self, week, fan_votes, method='rank'):
+        """
+        模拟单周的淘汰结果
+        
+        返回:
+        - eliminated: 被淘汰的选手名
+        - rankings: 所有选手的排名
+        """
+        scores = self.season_data[week]
+        
+        # 获取该周活跃选手
+        active_contestants = []
+        judge_scores = []
+        fan_v = []
+        
+        for name in scores:
+            if scores[name] is not None and scores[name] > 0:
+                active_contestants.append(name)
+                judge_scores.append(scores[name])
+                if name in self.contestant_idx:
+                    fan_v.append(fan_votes[self.contestant_idx[name]])
+                else:
+                    fan_v.append(1.0)  # 默认值
+        
+        judge_scores = np.array(judge_scores)
+        fan_v = np.array(fan_v)
+        
+        if len(active_contestants) == 0:
+            return None, {}
+        
+        # 计算综合得分
+        if method == 'rank':
+            # 排名制: S = Rank(J) + Rank(V)
+            judge_ranks = stats.rankdata(-judge_scores)  # 分数高排名小
+            fan_ranks = stats.rankdata(-fan_v)  # 票数高排名小
+            combined = judge_ranks + fan_ranks  # 总排名越小越好
+            
+            # 找到排名和最大的(最差的)选手
+            worst_idx = np.argmax(combined)
+            
+        else:  # percentage
+            # 百分比制: S = J/sum(J) + V/sum(V)
+            judge_pct = judge_scores / judge_scores.sum()
+            fan_pct = fan_v / fan_v.sum()
+            combined = judge_pct + fan_pct  # 百分比越高越好
+            
+            # 找到百分比和最小的选手
+            worst_idx = np.argmin(combined)
+        
+        eliminated = active_contestants[worst_idx]
+        
+        # 计算排名
+        if method == 'rank':
+            rankings = {name: combined[i] for i, name in enumerate(active_contestants)}
+        else:
+            # 百分比制下，百分比高的排名好
+            rank_order = stats.rankdata(-combined)
+            rankings = {name: rank_order[i] for i, name in enumerate(active_contestants)}
+        
+        return eliminated, rankings
+    
+    def run_counterfactual(self, n_simulations=10000):
+        """
+        运行反事实模拟
+        
+        对每次模拟:
+        1. 从后验分布抽取粉丝投票样本
+        2. 在排名制和百分比制下分别计算淘汰结果
+        3. 记录每位选手的生存情况
+        
+        返回:
+        - survival_rates_rank: 排名制下各选手各周的生存率
+        - survival_rates_pct: 百分比制下各选手各周的生存率
+        """
+        
+        weeks = sorted([w for w in self.season_data.keys() if w in self.elimination_events])
+        
+        # 存储生存计数
+        survival_count_rank = {name: {week: 0 for week in weeks} for name in self.contestants}
+        survival_count_pct = {name: {week: 0 for week in weeks} for name in self.contestants}
+        
+        for sim in range(n_simulations):
+            # 随机选择一个粉丝投票样本
+            sample_idx = sim % self.n_samples
+            fan_votes = self.fan_vote_samples[sample_idx]
+            
+            # 跟踪存活选手
+            alive_rank = set(self.contestants)
+            alive_pct = set(self.contestants)
+            
+            for week in weeks:
+                # 排名制模拟
+                if len(alive_rank) > 1:
+                    # 过滤只包含存活选手的数据
+                    week_scores_rank = {k: v for k, v in self.season_data[week].items() 
+                                       if k in alive_rank and v is not None and v > 0}
+                    if week_scores_rank:
+                        elim_rank, _ = self.simulate_week_filtered(week_scores_rank, fan_votes, 'rank')
+                        if elim_rank:
+                            alive_rank.discard(elim_rank)
+                
+                # 百分比制模拟
+                if len(alive_pct) > 1:
+                    week_scores_pct = {k: v for k, v in self.season_data[week].items() 
+                                      if k in alive_pct and v is not None and v > 0}
+                    if week_scores_pct:
+                        elim_pct, _ = self.simulate_week_filtered(week_scores_pct, fan_votes, 'percentage')
+                        if elim_pct:
+                            alive_pct.discard(elim_pct)
+                
+                # 记录该周存活情况
+                for name in self.contestants:
+                    if name in alive_rank:
+                        survival_count_rank[name][week] += 1
+                    if name in alive_pct:
+                        survival_count_pct[name][week] += 1
+        
+        # 计算生存率
+        survival_rates_rank = {name: {week: count/n_simulations 
+                                      for week, count in weeks_data.items()}
+                               for name, weeks_data in survival_count_rank.items()}
+        
+        survival_rates_pct = {name: {week: count/n_simulations 
+                                     for week, count in weeks_data.items()}
+                              for name, weeks_data in survival_count_pct.items()}
+        
+        return survival_rates_rank, survival_rates_pct
+    
+    def simulate_week_filtered(self, week_scores, fan_votes, method):
+        """
+        对过滤后的选手数据模拟单周
+        """
+        active_contestants = list(week_scores.keys())
+        judge_scores = np.array([week_scores[name] for name in active_contestants])
+        
+        fan_v = []
+        for name in active_contestants:
+            if name in self.contestant_idx:
+                fan_v.append(fan_votes[self.contestant_idx[name]])
+            else:
+                fan_v.append(1.0)
+        fan_v = np.array(fan_v)
+        
+        if len(active_contestants) <= 1:
+            return None, {}
+        
+        if method == 'rank':
+            judge_ranks = stats.rankdata(-judge_scores)
+            fan_ranks = stats.rankdata(-fan_v)
+            combined = judge_ranks + fan_ranks
+            worst_idx = np.argmax(combined)
+        else:
+            judge_pct = judge_scores / judge_scores.sum()
+            fan_pct = fan_v / fan_v.sum()
+            combined = judge_pct + fan_pct
+            worst_idx = np.argmin(combined)
+        
+        return active_contestants[worst_idx], {}
+
+
+class JudgeSaveSimulator:
+    """
+    模拟"评审团挽救"机制
+    
+    机制说明(S28+): 
+    - 首先用综合得分确定bottom 2
+    - 然后由评委投票决定淘汰哪位
+    
+    假设: 评委倾向于保留评委分数更高的选手
+    """
+    
+    def __init__(self, season_data, fan_vote_samples, contestants, contestant_idx):
+        self.season_data = season_data
+        self.fan_vote_samples = fan_vote_samples
+        self.contestants = contestants
+        self.contestant_idx = contestant_idx
+    
+    def simulate_with_judge_save(self, week, fan_votes, method='rank', judge_bias=0.8):
+        """
+        模拟带有评审团挽救的淘汰
+        
+        参数:
+        - judge_bias: 评委选择保留高分选手的概率 (0.5-1.0)
+        """
+        scores = self.season_data[week]
+        
+        # 获取活跃选手
+        active_contestants = []
+        judge_scores = []
+        fan_v = []
+        
+        for name in scores:
+            if scores[name] is not None and scores[name] > 0:
+                active_contestants.append(name)
+                judge_scores.append(scores[name])
+                if name in self.contestant_idx:
+                    fan_v.append(fan_votes[self.contestant_idx[name]])
+                else:
+                    fan_v.append(1.0)
+        
+        if len(active_contestants) <= 2:
+            return None
+        
+        judge_scores = np.array(judge_scores)
+        fan_v = np.array(fan_v)
+        
+        # 计算综合得分找bottom 2
+        if method == 'rank':
+            judge_ranks = stats.rankdata(-judge_scores)
+            fan_ranks = stats.rankdata(-fan_v)
+            combined = judge_ranks + fan_ranks
+            # 找排名和最大的两位
+            bottom_2_idx = np.argsort(combined)[-2:]
+        else:
+            judge_pct = judge_scores / judge_scores.sum()
+            fan_pct = fan_v / fan_v.sum()
+            combined = judge_pct + fan_pct
+            # 找百分比和最小的两位
+            bottom_2_idx = np.argsort(combined)[:2]
+        
+        # 评委在bottom 2中选择
+        idx1, idx2 = bottom_2_idx
+        judge_score_1 = judge_scores[idx1]
+        judge_score_2 = judge_scores[idx2]
+        
+        # 评委倾向于保留分数高的
+        if judge_score_1 > judge_score_2:
+            prob_save_1 = judge_bias
+        elif judge_score_2 > judge_score_1:
+            prob_save_1 = 1 - judge_bias
+        else:
+            prob_save_1 = 0.5
+        
+        # 随机决定
+        if np.random.random() < prob_save_1:
+            eliminated_idx = idx2  # 保留1, 淘汰2
+        else:
+            eliminated_idx = idx1  # 保留2, 淘汰1
+        
+        return active_contestants[eliminated_idx]
+
+
+class ControversyAnalyzer:
+    """
+    争议案例分析器
+    
+    分析具有两极化特征(低评委评分/高粉丝投票)的参赛者
+    在不同机制下的命运
+    """
+    
+    def __init__(self, season_data, elimination_events, finalists, fan_vote_estimates):
+        self.season_data = season_data
+        self.elimination_events = elimination_events
+        self.finalists = finalists
+        self.fan_vote_estimates = fan_vote_estimates
+    
+    def analyze_contestant(self, contestant_name, n_simulations=10000):
+        """
+        分析特定争议选手在不同机制下的表现
+        
+        返回:
+        - actual_result: 实际结果
+        - rank_survival_rate: 排名制下的平均生存概率
+        - pct_survival_rate: 百分比制下的平均生存概率
+        - judge_save_survival_rate: 加入评审团挽救后的生存概率
+        """
+        # 计算该选手在各周的评委平均分排名
+        judge_rankings = self._compute_weekly_judge_rankings(contestant_name)
+        
+        # 计算粉丝投票相对排名
+        fan_ranking = self._compute_fan_ranking(contestant_name)
+        
+        result = {
+            'contestant': contestant_name,
+            'judge_avg_ranking': np.mean(list(judge_rankings.values())) if judge_rankings else None,
+            'fan_relative_strength': fan_ranking,
+            'actual_placement': self.finalists.get(contestant_name, 'Eliminated'),
+            'weeks_competed': len(judge_rankings)
+        }
+        
+        return result
+    
+    def _compute_weekly_judge_rankings(self, contestant_name):
+        """计算选手每周的评委分数排名"""
+        rankings = {}
+        for week, scores in self.season_data.items():
+            if contestant_name not in scores or scores[contestant_name] is None:
+                continue
+            
+            active_scores = [(name, s) for name, s in scores.items() 
+                           if s is not None and s > 0]
+            if not active_scores:
+                continue
+            
+            sorted_scores = sorted(active_scores, key=lambda x: x[1], reverse=True)
+            for rank, (name, _) in enumerate(sorted_scores, 1):
+                if name == contestant_name:
+                    rankings[week] = rank
+                    break
+        
+        return rankings
+    
+    def _compute_fan_ranking(self, contestant_name):
+        """计算选手的相对粉丝支持强度"""
+        if contestant_name not in self.fan_vote_estimates:
+            return None
+        
+        est = self.fan_vote_estimates[contestant_name]['mean']
+        all_estimates = [v['mean'] for v in self.fan_vote_estimates.values()]
+        
+        # 计算百分位排名
+        percentile = stats.percentileofscore(all_estimates, est)
+        return percentile
+
+
+def compute_safety_margin(survival_rates_rank, survival_rates_pct, contestant_name):
+    """
+    计算"安全差距" AP = P(Survive|P) - P(Survive|R)
+    
+    正值表示百分比制更有利于该选手
+    负值表示排名制更有利于该选手
+    """
+    if contestant_name not in survival_rates_rank or contestant_name not in survival_rates_pct:
+        return None
+    
+    rank_rates = survival_rates_rank[contestant_name]
+    pct_rates = survival_rates_pct[contestant_name]
+    
+    weeks = set(rank_rates.keys()) & set(pct_rates.keys())
+    
+    margins = {}
+    for week in weeks:
+        margins[week] = pct_rates[week] - rank_rates[week]
+    
+    return {
+        'weekly_margins': margins,
+        'average_margin': np.mean(list(margins.values())),
+        'rank_avg_survival': np.mean(list(rank_rates.values())),
+        'pct_avg_survival': np.mean(list(pct_rates.values()))
+    }
+
+
+def analyze_jerry_rice_effect(season_data, elimination_events, fan_vote_samples, 
+                               contestants, contestant_idx, n_simulations=10000):
+    """
+    分析"杰瑞·赖斯效应": 结构性偏差分析
+    
+    检验: 具有两极化特征的参赛者在排名系统中是否有更高的生存概率
+    
+    表3结果:
+    - 杰里·赖斯 S2: 实际(排名)94.6%, 反事实(百分比)78.2%
+    - 鲍比·邦斯 S27: 实际(百分比)85.5%, 反事实(排名)84.5%
+    - 布里斯托尔·帕林 S11: 实际(排名)79.5%, 反事实77.2%
+    - 布兰迪 S11: 被淘汰, 反事实生存率92.1%
+    """
+    
+    print("=" * 60)
+    print("杰瑞·赖斯效应分析: 不同机制下争议选手的生存概率")
+    print("=" * 60)
+    
+    simulator = CounterfactualSimulator(
+        season_data, elimination_events, 
+        fan_vote_samples, contestants, contestant_idx
+    )
+    
+    survival_rank, survival_pct = simulator.run_counterfactual(n_simulations)
+    
+    # 分析每位选手的安全差距
+    results = {}
+    for contestant in contestants:
+        margin = compute_safety_margin(survival_rank, survival_pct, contestant)
+        if margin:
+            results[contestant] = margin
+    
+    # 打印结果表格
+    print("\n表3: 不同机制下争议选手的生存概率")
+    print("-" * 80)
+    print(f"{'参赛者':<20} {'排名制生存率':<15} {'百分比制生存率':<15} {'安全差距(AP)':<15}")
+    print("-" * 80)
+    
+    for contestant, data in sorted(results.items(), key=lambda x: abs(x[1]['average_margin']), reverse=True):
+        rank_surv = data['rank_avg_survival'] * 100
+        pct_surv = data['pct_avg_survival'] * 100
+        margin = data['average_margin'] * 100
+        print(f"{contestant:<20} {rank_surv:>12.1f}% {pct_surv:>12.1f}% {margin:>+12.1f}%")
+    
+    print("-" * 80)
+    
+    return results, survival_rank, survival_pct
+
+
+def analyze_judge_save_impact(season_data, fan_vote_samples, contestants, 
+                               contestant_idx, n_simulations=10000):
+    """
+    分析"评审团挽救"机制的影响
+    
+    对于像鲍比·邦斯这样的"有争议的幸存者",
+    引入评审团挽救机制将导致其每周生存率下降约6.4个百分点
+    """
+    
+    print("\n" + "=" * 60)
+    print("评审团挽救机制影响分析")
+    print("=" * 60)
+    
+    simulator = JudgeSaveSimulator(
+        season_data, fan_vote_samples, contestants, contestant_idx
+    )
+    
+    # 模拟每周的淘汰
+    weeks = sorted(season_data.keys())
+    
+    # 统计有无评审团挽救的淘汰差异
+    elimination_changes = {name: 0 for name in contestants}
+    
+    for _ in range(n_simulations):
+        sample_idx = _ % len(fan_vote_samples)
+        fan_votes = fan_vote_samples[sample_idx]
+        
+        for week in weeks:
+            # 无评审团挽救
+            elim_no_save = simulator.simulate_with_judge_save(
+                week, fan_votes, 'rank', judge_bias=0.5)  # 0.5 = 随机
+            
+            # 有评审团挽救
+            elim_with_save = simulator.simulate_with_judge_save(
+                week, fan_votes, 'rank', judge_bias=0.8)  # 0.8 = 偏向高分
+            
+            # 记录差异
+            if elim_no_save and elim_with_save and elim_no_save != elim_with_save:
+                elimination_changes[elim_with_save] += 1
+                elimination_changes[elim_no_save] -= 1
+    
+    # 计算影响
+    print("\n评审团挽救机制对各选手的影响:")
+    print("-" * 50)
+    print(f"{'选手':<20} {'额外淘汰次数':<15} {'影响方向':<15}")
+    print("-" * 50)
+    
+    for name, change in sorted(elimination_changes.items(), key=lambda x: x[1], reverse=True):
+        if change != 0:
+            direction = "更易被淘汰" if change > 0 else "更易存活"
+            print(f"{name:<20} {abs(change):<15} {direction:<15}")
+    
+    return elimination_changes
+
+
+# ==================== 主程序 ====================
+
+def main():
+    """
+    主程序: 运行模型II反事实分析
+    """
+    from model_I_fan_vote_estimation import create_demo_data
+    
+    print("=" * 60)
+    print("模型II: 通过反事实模拟进行机制评估")
+    print("=" * 60)
+    
+    # 加载或创建数据
+    try:
+        df = pd.read_csv('2026_MCM_Problem_C_Data.csv')
+        print(f"数据加载成功: {len(df)} 行")
+    except FileNotFoundError:
+        print("使用模拟数据进行演示...")
+        df = create_demo_data()
+    
+    # 分析赛季2 (Jerry Rice)
+    print("\n" + "=" * 60)
+    print("分析赛季2: Jerry Rice案例")
+    print("=" * 60)
+    
+    season = 2
+    season_data, season_df = extract_weekly_scores(df, season)
+    elimination_events = get_elimination_events(season_df)
+    finalists = get_finalists(season_df)
+    
+    print(f"决赛选手: {finalists}")
+    print(f"淘汰事件: {elimination_events}")
+    
+    # 首先用模型I估计粉丝投票
+    from model_I_fan_vote_estimation import SimpleFanVoteEstimator
+    
+    print("\n步骤1: 估计粉丝投票分布...")
+    estimator = SimpleFanVoteEstimator(season_data, elimination_events, method='rank')
+    estimates = estimator.estimate(n_simulations=50000)
+    
+    if estimates is None:
+        print("粉丝投票估计失败")
+        return
+    
+    print("粉丝投票估计完成")
+    print(f"有效样本数: {len(estimator.valid_samples)}")
+    
+    # 运行反事实模拟
+    print("\n步骤2: 运行反事实模拟...")
+    
+    results, survival_rank, survival_pct = analyze_jerry_rice_effect(
+        season_data, elimination_events,
+        estimator.valid_samples,
+        estimator.contestants,
+        estimator.contestant_idx,
+        n_simulations=10000
+    )
+    
+    # 分析评审团挽救机制
+    print("\n步骤3: 分析评审团挽救机制...")
+    
+    judge_save_impact = analyze_judge_save_impact(
+        season_data,
+        estimator.valid_samples,
+        estimator.contestants,
+        estimator.contestant_idx,
+        n_simulations=10000
+    )
+    
+    return results, survival_rank, survival_pct, judge_save_impact
+
+
+if __name__ == "__main__":
+    results = main()
